@@ -1249,7 +1249,7 @@ class EmbeddingGradientShuffleKernel final : public user_op::OpKernel {
 
     if (!enable_quantized_comm) {
       const int64_t even_embedding_size =
-          (embedding_size % 2 != 0) ? (embedding_size + 1) : embedding_size;
+          (embedding_size % 2 != 0 && data_type == DataType::kFloat16) ? (embedding_size + 1) : embedding_size;
       unique_partition_embedding_grad_size =
           GetCudaAlignedSize(full_num_ids * even_embedding_size * sizeof(T));
       size_t received_embedding_grad_size = unique_partition_embedding_grad_size;
