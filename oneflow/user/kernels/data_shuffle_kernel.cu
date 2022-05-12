@@ -23,6 +23,9 @@ limitations under the License.
 #include "oneflow/core/cuda/atomic.cuh"
 #include "oneflow/core/embedding/hash_functions.cuh"
 #include "oneflow/core/cuda/elementwise.cuh"
+#include "oneflow/core/common/nd_index_offset_helper.h"
+#include "oneflow/core/ep/include/primitive/copy_nd.h"
+#include "oneflow/core/cuda/atomic.cuh"
 
 namespace oneflow {
 
@@ -93,6 +96,95 @@ template<typename U>
 __global__ void GenerateTableIds(int32_t elem_cnt, int32_t num_tables, U* table_ids) {
   CUDA_1D_KERNEL_LOOP(i, elem_cnt) { table_ids[i] = i % num_tables; }
 }
+
+template<typename K, typename IDX>
+__global__ void UnsortedSegmentHalfGpu(const IDX in_h2_elem_cnt, const IDX h2_inner_dim_size,
+                                       const IDX inner_dim_size, const half* data,
+                                       const K* segment_ids, const IDX num_segments,
+                                       half2* out_h2) {
+  CUDA_1D_KERNEL_LOOP_T(IDX, i, in_h2_elem_cnt) {
+    const int segment_id_idx = i / h2_inner_dim_size;
+    const int h2_inner_idx = i - segment_id_idx * h2_inner_dim_size;
+    const int inner_idx_0 = 2 * h2_inner_idx;
+    const int inner_idx_1 = 2 * h2_inner_idx + 1;
+    const half* data_row = data + segment_id_idx * inner_dim_size;
+    half2 val;
+    val.x = data_row[inner_idx_0];
+    val.y = (inner_idx_1 >= inner_dim_size) ? static_cast<half>(0) : data_row[inner_idx_1];
+    const K origin_idx = segment_ids[segment_id_idx];
+    const IDX idx = origin_idx;
+    int out_h2_offset = idx * h2_inner_dim_size + h2_inner_idx;
+    cuda::atomic::Add(out_h2 + out_h2_offset, val);
+  }
+}
+
+template<typename T, typename K>
+struct UnsortedSegmentSumImpl {
+  UnsortedSegmentSumImpl(int64_t num_segments, int64_t inner_dim_size)
+      : num_segments(num_segments), inner_dim_size(inner_dim_size) {}
+
+  size_t TmpBufferBytes() { return 0; }
+
+  void Launch(ep::Stream* stream, const K* segment_ids, const T* data, int64_t num_segment_ids,
+              int64_t num_segments, int64_t inner_dim_size, T* out, void* tmp_buffer) {
+    NdIndexOffsetHelper<int64_t, 2> in_helper(num_segment_ids, inner_dim_size);
+    NdIndexOffsetHelper<int64_t, 2> out_helper(num_segments, inner_dim_size);
+    UnsortedSegmentSumKernelUtil<DeviceType::kCUDA, T, K, T>::UnsortedSegmentSum(
+        stream, segment_ids, data, num_segment_ids, num_segments, 1, inner_dim_size, 0, out);
+  }
+
+  int64_t num_segments;
+  int64_t inner_dim_size;
+};
+
+template<typename K>
+struct UnsortedSegmentSumImpl<half, K> {
+  UnsortedSegmentSumImpl(int64_t num_segments, int64_t inner_dim_size)
+      : num_segments(num_segments), inner_dim_size(inner_dim_size) {}
+
+  size_t TmpBufferBytes() {
+    if (inner_dim_size % 2 == 0) {
+      return 0;
+    } else {
+      return GetCudaAlignedSize(num_segments * (inner_dim_size + 1) * sizeof(half));
+    }
+  }
+
+  void Launch(ep::Stream* stream, const K* segment_ids, const half* data, int64_t num_segment_ids,
+              int64_t num_segments, int64_t inner_dim_size, half* out, void* tmp_buffer) {
+    if (inner_dim_size % 2 == 0) {
+      NdIndexOffsetHelper<int64_t, 2> in_helper(num_segment_ids, inner_dim_size);
+      NdIndexOffsetHelper<int64_t, 2> out_helper(num_segments, inner_dim_size);
+      UnsortedSegmentSumKernelUtil<DeviceType::kCUDA, half, K, half>::UnsortedSegmentSum(
+          stream, segment_ids, data, num_segment_ids, num_segments, 1, inner_dim_size, 0, out);
+    } else {
+      // memset tmp_buffer, can be optimized
+      OF_CUDA_CHECK(cudaMemsetAsync(tmp_buffer, 0,
+                                    num_segments * (inner_dim_size + 1) * sizeof(half),
+                                    stream->As<ep::CudaStream>()->cuda_stream()));
+      const int64_t h2_inner_dim_size = (inner_dim_size + 1) / 2;
+      const int64_t in_h2_elem_cnt = num_segment_ids * h2_inner_dim_size;
+      half2* h2_tmp_buffer = reinterpret_cast<half2*>(tmp_buffer);
+      UnsortedSegmentHalfGpu<<<BlocksNum4ThreadsNum(in_h2_elem_cnt), kCudaThreadsNumPerBlock, 0,
+                               stream->As<ep::CudaStream>()->cuda_stream()>>>(
+          in_h2_elem_cnt, h2_inner_dim_size, inner_dim_size, data, segment_ids, num_segments,
+          h2_tmp_buffer);
+
+      std::unique_ptr<ep::primitive::CopyNd> primitive =
+          ep::primitive::NewPrimitive<ep::primitive::CopyNdFactory>(DeviceType::kCUDA, 2);
+      DimVector dst_shape = {num_segments, inner_dim_size};
+      DimVector dst_pos_vec = {0, 0};
+      DimVector src_shape = {num_segments, inner_dim_size + 1};
+      DimVector src_pos_vec = {0, 0};
+      DimVector extent_vec = {num_segments, inner_dim_size};
+      primitive->Launch(stream, DataType::kFloat16, 2, out, dst_shape.data(), dst_pos_vec.data(),
+                        tmp_buffer, src_shape.data(), src_pos_vec.data(), extent_vec.data());
+    }
+  }
+
+  int64_t num_segments;
+  int64_t inner_dim_size;
+};
 
 template<typename K, typename V, typename IDX, typename HASH>
 void UniqueAndPartition(cudaStream_t cuda_stream, int64_t num_ids, size_t capacity,
@@ -1160,21 +1252,46 @@ class EmbeddingGradientShuffleKernel final : public user_op::OpKernel {
       T* unique_partition_embedding_grad = reinterpret_cast<T*>(tmp_buffer->mut_dptr());
       T* received_embedding_grad =
           reinterpret_cast<T*>(tmp_buffer->mut_dptr<char>() + unique_partition_embedding_grad_size);
+      UnsortedSegmentSumImpl<T, IDX> unsorted_segment_sum_before_shuffle(full_num_ids,
+                                                                         embedding_size);
+      UnsortedSegmentSumImpl<T, IDX> unsorted_segment_sum_after_shuffle(cur_rank_num_ids,
+                                                                        embedding_size);
+      char* tmp_buffer_before_shuffle = tmp_buffer->mut_dptr<char>()
+                                        + unique_partition_embedding_grad_size
+                                        + received_embedding_grad_size;
+      char* tmp_buffer_after_shuffle =
+          tmp_buffer_before_shuffle + unsorted_segment_sum_before_shuffle.TmpBufferBytes();
+
       CHECK_GE(tmp_buffer->shape().elem_cnt(),
-               unique_partition_embedding_grad_size + received_embedding_grad_size);
+               unique_partition_embedding_grad_size + received_embedding_grad_size
+                   + unsorted_segment_sum_before_shuffle.TmpBufferBytes()
+                   + unsorted_segment_sum_after_shuffle.TmpBufferBytes());
 
       // unique and partition embedding grad
       for (int64_t i = 0; i < parallel_num; ++i) {
+        if(embedding_size % 2 == 0) {
         const int64_t offset = i * num_ids * embedding_size;
         const int64_t valid_value_size =
             host_num_unique_matrix[parallel_id * parallel_num + i] * embedding_size * sizeof(T);
-        OF_CUDA_CHECK(cudaMemsetAsync(unique_partition_embedding_grad + offset, 0, valid_value_size,
-                                      cuda_stream));
+          OF_CUDA_CHECK(cudaMemsetAsync(unique_partition_embedding_grad + offset, 0, valid_value_size,
+                                        cuda_stream));
+        } else {
+        const int64_t even_embedding_size = (embedding_size + 1);
+        const int64_t offset = i * num_ids * even_embedding_size;
+        const int64_t valid_value_size =
+            host_num_unique_matrix[parallel_id * parallel_num + i] * even_embedding_size * sizeof(T);
+          OF_CUDA_CHECK(cudaMemsetAsync(tmp_buffer_before_shuffle + offset, 0, valid_value_size,
+                                        cuda_stream));
+        }
       }
-      UnsortedSegmentSumKernelUtil<DeviceType::kCUDA, T, IDX, T>::UnsortedSegmentSum(
+      // UnsortedSegmentSumKernelUtil<DeviceType::kCUDA, T, IDX, T>::UnsortedSegmentSum(
+      //    ctx->stream(), reinterpret_cast<const IDX*>(inverse_unique_partition_indices->dptr()),
+      //    embedding_grad->dptr<T>(), num_ids, parallel_num * num_ids, 1, embedding_size, 0,
+      //    unique_partition_embedding_grad);
+      unsorted_segment_sum_before_shuffle.Launch(
           ctx->stream(), reinterpret_cast<const IDX*>(inverse_unique_partition_indices->dptr()),
-          embedding_grad->dptr<T>(), num_ids, parallel_num * num_ids, 1, embedding_size, 0,
-          unique_partition_embedding_grad);
+          embedding_grad->dptr<T>(), num_ids, parallel_num * num_ids, embedding_size,
+          unique_partition_embedding_grad, tmp_buffer_before_shuffle);
 
       ShuffleEmbeddingsGrad(cuda_stream, comm, parallel_id, parallel_num, num_ids, embedding_size,
                             data_type, host_num_unique_matrix, unique_partition_embedding_grad,
@@ -1183,10 +1300,14 @@ class EmbeddingGradientShuffleKernel final : public user_op::OpKernel {
       // unique cur_rank embedding grad
       OF_CUDA_CHECK(cudaMemsetAsync(cur_rank_unique_embedding_grad->mut_dptr(), 0,
                                     cur_rank_num_ids * embedding_size * sizeof(T), cuda_stream));
-      UnsortedSegmentSumKernelUtil<DeviceType::kCUDA, T, IDX, T>::UnsortedSegmentSum(
+      // UnsortedSegmentSumKernelUtil<DeviceType::kCUDA, T, IDX, T>::UnsortedSegmentSum(
+      //    ctx->stream(), reinterpret_cast<const IDX*>(cur_rank_inverse_indices->dptr()),
+      //    received_embedding_grad, cur_rank_num_ids, cur_rank_num_ids, 1, embedding_size, 0,
+      //    cur_rank_unique_embedding_grad->mut_dptr<T>());
+      unsorted_segment_sum_after_shuffle.Launch(
           ctx->stream(), reinterpret_cast<const IDX*>(cur_rank_inverse_indices->dptr()),
-          received_embedding_grad, cur_rank_num_ids, cur_rank_num_ids, 1, embedding_size, 0,
-          cur_rank_unique_embedding_grad->mut_dptr<T>());
+          received_embedding_grad, cur_rank_num_ids, cur_rank_num_ids, embedding_size,
+          cur_rank_unique_embedding_grad->mut_dptr<T>(), tmp_buffer_after_shuffle);
     } else {
       size_t received_embedding_grad_size = GetCudaAlignedSize(full_elem_cnt * sizeof(int8_t));
       size_t quantize_cur_rank_embedding_grad_size = received_embedding_grad_size;
@@ -1299,7 +1420,7 @@ class EmbeddingGradientShuffleKernel final : public user_op::OpKernel {
         if (!enable_quantized_comm) {                                                             \
           size_t cur_rank_embedding_grad_size = GetCudaAlignedSize(                               \
               cur_rank_embedding_grad_elem_cnt * sizeof(OF_PP_PAIR_FIRST(t_dtype_pair)));         \
-          tmp_size = 2 * cur_rank_embedding_grad_size;                                            \
+          tmp_size = 4 * cur_rank_embedding_grad_size;                                            \
         } else {                                                                                  \
           size_t unique_partition_embedding_grad_size = GetCudaAlignedSize(                       \
               cur_rank_embedding_grad_elem_cnt * sizeof(OF_PP_PAIR_FIRST(t_dtype_pair)));         \
